@@ -1,4 +1,4 @@
-# Tensor_trade_Notebook
+# Tensor-Trade-Notebook
 ##### Collection of thoughts and notes about my experience trying to beat the market. 
 Resources:
 GITHUB Author @NotAdamKing
