@@ -14,3 +14,5 @@ GITHUB Author @philipperemy
 https://github.com/philipperemy/FX-1-Minute-Data/blob/master/download_all_fx_data.py 
 
 https://en.wikipedia.org/wiki/Sortino_ratio
+
+https://hackernoon.com/understanding-architecture-of-lstm-cell-from-scratch-with-code-8da40f0b71f4
