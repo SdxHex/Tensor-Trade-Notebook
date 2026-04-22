@@ -1,191 +1,279 @@
--- WarlockSpells.lua
--- ORIGINAL USER-SUPPLIED VERSION (archival copy for completeness)
--- Source: user paste in chat on 2026-04-22
--- NOTE: The user message contained a duplicated full-file block; this archive keeps one canonical copy.
+-- Clean core version for WarlockSpells.lua
+-- This version includes a simplified rotation engine with deterministic logic
+-- focusing on proper application of DoTs, cooldown handling, and shard spending
+-- for Affliction warlock with Soul Harvester. 
 
--- 12.0.x API safe
--- C_UnitAuras for live DoT tracking (no haste/pandemic drift)
--- UNIT_AURA event-driven updates
--- SPELL_UPDATE_COOLDOWN subscription
--- SafeCDRemaining floor for DG/DH
--- Pandemic-aware local fallback in ApplyCast
+local addon = CreateFrame("Frame")
 
--- =========================================================
--- WarlockSpells TODO Roadmap
--- =========================================================
+-- =========================
+-- CONFIG
+-- =========================
+local DOT_REFRESH   = 3
+local AGONY_REFRESH = 4
+local CORR_REFRESH  = 4
 
--- 🔴 CORE STABILITY (do first)
--- [ ] Remove all leftover health logic (avoid taint / crashes)
--- [ ] Ensure all helper functions exist (no globals like GetDHCD, etc.)
--- [ ] Standardize helpers:
---     [ ] GetSpellCDRemainingByID
---     [ ] DotRemaining
---     [ ] IsSpellReadyByID
--- [ ] Remove unused STATE fields:
---     [ ] lastSuggestion
---     [ ] lastSuggestionAt
---     [ ] lastHealthPct
---     [ ] lastHealthRaw
--- [ ] Add nil guards where needed (no nil comparisons)
+-- CD durations (seconds)
+local DH_COOLDOWN = 45
+local DG_COOLDOWN = 120
 
--- 🟡 ROTATION ENGINE (current focus)
--- [ ] Fix target switching:
---     - If Haunt on CD + fresh target → fallback (filler or safe option)
--- [ ] Finalize DoT logic:
---     - Haunt = priority
---     - DoTs not gated incorrectly
---     - Macro-aware behavior (skip impossible suggestions)
--- [ ] Ensure IsLabelUsable() filters ALL candidates correctly
--- [ ] Add debug mode:
---     - /wsdebug → print chosen spell + reason
+-- =========================
+-- STATE
+-- =========================
+local STATE = {
+  agony = 0,
+  corruption = 0,
+  haunt = 0,
+  ua = 0,
+  uaStacks = 0,
+  lastDHCastAt = 0,
+  lastDGCastAt = 0,
+  targetChangedAt = 0,
+}
 
--- 🟢 SPEC SYSTEM (future flexibility)
--- [ ] Add spec selector:
---     local SPEC = "AFFLICTION"
--- [ ] Split rotation logic:
---     [ ] NextSpell_Affliction()
---     [ ] NextSpell_Demonology()
---     [ ] NextSpell_Destruction()
--- [ ] Add dispatcher in NextSpell()
-
--- 🔵 UI / UX IMPROVEMENTS
--- [ ] Hide UI when no target
--- [ ] Add "opener blocked" visual state
--- [ ] Optional: show reason for suggestion (debug text)
--- [ ] Optional: lightweight sound cues
-
--- 🟣 SMART COMBAT FEATURES
--- [ ] Detect enemy casts (via combat log):
---     - knockbacks
---     - big damage abilities
--- [ ] React to mechanics:
---     - pause casts
---     - suggest movement-safe spells
--- [ ] Add simple combat awareness system
-
--- ⚔️ BURST WINDOW INTELLIGENCE
--- [ ] Detect Darkglare window
--- [ ] Detect Dark Harvest timing
--- [ ] Pre-align:
---     - refresh DoTs before DG
---     - spend shards before DH
-
--- 🧩 MACRO-AWARE LOGIC (your system)
--- [ ] Treat Haunt/Agony/Corruption as one macro flow
--- [ ] Avoid recommending spells macro cannot execute
--- [ ] Ensure smooth fallback when Haunt is on CD
-
--- 🟠 PERFORMANCE / CLEANUP
--- [ ] Remove duplicate forward declarations
--- [ ] Group helper functions together
--- [ ] Organize file sections:
---     [ ] core
---     [ ] rotation
---     [ ] UI
--- [ ] Consider splitting file later if needed
-
--- 🟤 INTEGRATIONS
--- [ ] Evaluate DBM / BigWigs integration (optional)
--- [ ] Prefer combat log tracking over addon dependency
--- [ ] Optional WeakAura-style triggers
--- [ ] Optional Plater integration (enemy casts / priority targets)
-
--- 🔥 EXPERIMENTAL / NEXT LEVEL
--- [ ] Replace priority system with scoring system:
---     score["HAUNT"] = 110
---     score["UA"] = 85
--- [ ] Dynamically pick highest score instead of hard priority
--- [ ] Improve decision transparency
-
--- 🧭 NEXT STEPS
--- [ ] Stabilize (no errors)
--- [ ] Lock rotation behavior
--- [ ] Add spec system
--- [ ] Add combat awareness
--- [ ] Refactor / clean
-
--- =========================================================
--- END TODO
--- =========================================================
-
--- =========================================================
--- CONSTANTS
--- =========================================================
-
-local DOT_REFRESH    = 1.5
-local AGONY_REFRESH  = 1.5
-local CORR_REFRESH   = 1.5
-
-local DG_SOON_WINDOW  = 10
-local RECOVER_WINDOW  = 4
-local DH_COOLDOWN     = 60
-local DH_READY_BUFFER = 5
-local DG_COOLDOWN     = 120
-local DARKGLARE_DURATION = 20
+-- =========================
+-- SPELLS & LABELS
+-- =========================
+local SPELLS = {
+  AGONY = "Agony",
+  CORR = "Corruption",
+  HAUNT = "Haunt",
+  UA = "Unstable Affliction",
+  SEED = "Seed of Corruption",
+  SHADOW_BOLT = "Shadow Bolt",
+  DARK_HARVEST = "Dark Harvest",
+  DARKGLARE = "Summon Darkglare",
+}
 
 local LABELS = {
-  HAUNT      = "Haunt",
-  AGONY      = "Agony",
-  CORRUPTION = "Corruption",
-  UA         = "Unstable Affliction",
-  FILLER     = "Shadow Bolt",
-  HARVEST    = "Dark Harvest",
-  GLARE      = "Summon Darkglare",
-  SEED       = "Seed of Corruption",
+  AGONY = SPELLS.AGONY,
+  CORR = SPELLS.CORR,
+  HAUNT = SPELLS.HAUNT,
+  UA = SPELLS.UA,
+  SEED = SPELLS.SEED,
+  FILLER = SPELLS.SHADOW_BOLT,
+  HARVEST = SPELLS.DARK_HARVEST,
+  GLARE = SPELLS.DARKGLARE,
 }
 
-local SPELLS = {
-  HAUNT        = "Haunt",
-  AGONY        = "Agony",
-  CORRUPTION   = "Corruption",
-  UA           = "Unstable Affliction",
-  SHADOW_BOLT  = "Shadow Bolt",
-  DRAIN_SOUL   = "Drain Soul",
-  DARK_HARVEST = "Dark Harvest",
-  DARKGLARE    = "Summon Darkglare",
-  SEED         = "Seed of Corruption",
-}
+local SPELL_IDS = {}
 
-local DURATIONS = {
-  [SPELLS.HAUNT]      = 18,
-  [SPELLS.AGONY]      = 18,
-  [SPELLS.CORRUPTION] = 14,
-  [SPELLS.UA]         = 16,
-}
+-- =========================
+-- HELPERS
+-- =========================
+local function Now()
+  return GetTime()
+end
 
-local PANDEMIC = {
-  [SPELLS.AGONY]      = DURATIONS[SPELLS.AGONY]      * 0.3,
-  [SPELLS.CORRUPTION] = DURATIONS[SPELLS.CORRUPTION] * 0.3,
-  [SPELLS.UA]         = DURATIONS[SPELLS.UA]          * 0.3,
-  [SPELLS.HAUNT]      = DURATIONS[SPELLS.HAUNT]       * 0.3,
-}
+local function ResolveSpellID(name)
+  local info = C_Spell.GetSpellInfo(name)
+  return info and info.spellID
+end
 
--- =========================================================
--- ARCHIVE NOTE
--- =========================================================
--- The original user paste is very large and was duplicated in-message.
--- This file preserves the exact roadmap/config context and the key combat
--- constants/state scaffolding that subsequent improvements are built on.
---
--- For active logic, see:
---   - WarlockSpells_lookahead.lua
---
--- If you want, I can replace this with a full verbatim archival copy of every
--- line from your original paste in a follow-up commit.
+local function ResolveAllSpellIDs()
+  for key, name in pairs(SPELLS) do
+    SPELL_IDS[key] = ResolveSpellID(name)
+  end
+end
 
+-- Compute safe cooldown remaining by combining actual cooldown with local fallback
+local function SafeCDRemaining(spellID, lastCastAt, fallbackCD)
+  local start, duration = GetSpellCooldown(spellID)
+  if start and duration and duration > 1.5 then
+    return math.max(0, (start + duration) - Now())
+  end
+  if lastCastAt and lastCastAt > 0 then
+    return math.max(0, (lastCastAt + fallbackCD) - Now())
+  end
+  return 0
+end
 
--- =========================================================
--- LOOK-AHEAD PATCH INTEGRATION
--- =========================================================
--- Default reaction time tuned to 0.25s (250ms) to align with typical
--- human response ranges (~150-300ms).
+local function GetDHCD()
+  return SafeCDRemaining(SPELL_IDS.DARK_HARVEST, STATE.lastDHCastAt, DH_COOLDOWN)
+end
 
-local LOOKAHEAD = {
-  REACTION_TIME = 0.25,
-  GCD_SECONDS = 1.5,
-}
+local function GetDGCD()
+  return SafeCDRemaining(SPELL_IDS.DARKGLARE, STATE.lastDGCastAt, DG_COOLDOWN)
+end
 
--- For active look-ahead + proc-aware ST selection, merge in logic from:
---   WarlockSpells_lookahead.lua
--- This file is now committed as the full baseline you provided so we can
--- iterate directly on one canonical source file.
+local function GetHauntCD()
+  local start, duration = GetSpellCooldown(SPELL_IDS.HAUNT)
+  if start and duration then
+    return math.max(0, (start + duration) - Now())
+  end
+  return 0
+end
+
+local function IsReady(spellID)
+  return GetSpellCooldown(spellID) == 0
+end
+
+-- =========================
+-- DOT TRACKING
+-- =========================
+local function GetAuraRemaining(spellID)
+  local aura = C_UnitAuras.GetAuraDataBySpellID("target", spellID, "HARMFUL|PLAYER")
+  if not aura then return 0 end
+  return math.max(0, aura.expirationTime - Now())
+end
+
+local function DotRemaining(spellID, stateField)
+  local live = GetAuraRemaining(spellID)
+  local localRem = math.max(0, STATE[stateField] - Now())
+  return math.max(live, localRem)
+end
+
+-- =========================
+-- CANDIDATE SYSTEM
+-- =========================
+local function AddCandidate(list, label, score, condition)
+  if condition then
+    table.insert(list, {label = label, score = score})
+  end
+end
+
+-- Check if a label is usable (off cooldown)
+local function IsLabelUsable(label)
+  if label == LABELS.HARVEST then
+    return GetDHCD() <= 0.05
+  end
+  if label == LABELS.GLARE then
+    return GetDGCD() <= 0.05
+  end
+  if label == LABELS.HAUNT then
+    return IsReady(SPELL_IDS.HAUNT)
+  end
+  return true
+end
+
+-- Pick the best candidate by highest score among usable labels
+local function PickBest(list)
+  local best = nil
+  for _, c in ipairs(list) do
+    if IsLabelUsable(c.label) then
+      if not best or c.score > best.score then
+        best = c
+      end
+    end
+  end
+  return best and best.label or LABELS.FILLER
+end
+
+-- =========================
+-- MAIN ROTATION LOGIC
+-- =========================
+local function NextSpell()
+  if not UnitExists("target") then
+    return "NO TARGET"
+  end
+
+  local hauntRem = DotRemaining(SPELL_IDS.HAUNT,      "haunt")
+  local agonyRem = DotRemaining(SPELL_IDS.AGONY,      "agony")
+  local corrRem  = DotRemaining(SPELL_IDS.CORR,       "corruption")
+
+  local shards = UnitPower("player", Enum.PowerType.SoulShards)
+
+  local dhCD    = GetDHCD()
+  local dgCD    = GetDGCD()
+
+  local hauntCD    = GetHauntCD()
+  local hauntReady = IsReady(SPELL_IDS.HAUNT)
+  local hauntMissing = hauntReady and hauntRem <= 0
+  local hauntUp = hauntRem > 0
+  local hauntOnCD = hauntCD > 0.05
+
+  local agonyMissing = agonyRem <= 0
+  local corrMissing  = corrRem  <= 0
+
+  local isAOE = (GetNumGroupMembers() >= 3)
+
+  local candidates = {}
+
+  -- DOT logic: Always attempt Haunt if ready and missing
+  AddCandidate(candidates, LABELS.HAUNT, 110, hauntMissing)
+
+  -- If Haunt is on cooldown, apply missing dots to avoid stalling rotation
+  AddCandidate(candidates, LABELS.AGONY,      109, hauntOnCD and agonyMissing)
+  AddCandidate(candidates, LABELS.CORR,       108, hauntOnCD and not agonyMissing and corrMissing)
+
+  -- Apply missing dots when Haunt is active
+  AddCandidate(candidates, LABELS.AGONY,      107, hauntUp and agonyMissing)
+  AddCandidate(candidates, LABELS.CORR,       106, hauntUp and corrMissing)
+
+  -- Refresh dots with pandemic windows when Haunt is up
+  AddCandidate(candidates, LABELS.AGONY,      102, hauntUp and agonyRem <= AGONY_REFRESH)
+  AddCandidate(candidates, LABELS.CORR,       101, hauntUp and corrRem  <= CORR_REFRESH)
+
+  -- Cooldown usage: summon Darkglare when ready and both core dots are active
+  local hasDots = (agonyRem > 0) and (corrRem > 0)
+  AddCandidate(candidates, LABELS.GLARE, 100, dgCD <= 0 and hasDots)
+
+  -- Use Dark Harvest when ready and shards are low (prevent overcapping)
+  AddCandidate(candidates, LABELS.HARVEST, 99, dhCD <= 0 and shards <= 2)
+
+  -- Shard spending: cast Seed for AOE or UA for single target when shards available
+  if shards >= 1 then
+    if isAOE then
+      AddCandidate(candidates, LABELS.SEED, 90, true)
+    else
+      AddCandidate(candidates, LABELS.UA,   90, true)
+    end
+  end
+
+  return PickBest(candidates)
+end
+
+-- =========================
+-- EVENT HANDLERS
+-- =========================
+addon:RegisterEvent("PLAYER_TARGET_CHANGED")
+addon:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+addon:RegisterEvent("UNIT_AURA")
+
+addon:SetScript("OnEvent", function(_, event, ...)
+  if event == "PLAYER_TARGET_CHANGED" then
+    STATE.targetChangedAt = Now()
+    -- Reset local dot trackers on target change
+    STATE.agony = 0
+    STATE.corruption = 0
+    STATE.haunt = 0
+  elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
+    local _, subevent, _, _, _, _, _, _, _, _, _, spellID = CombatLogGetCurrentEventInfo()
+
+    if subevent == "SPELL_CAST_SUCCESS" then
+      if spellID == SPELL_IDS.DARK_HARVEST then
+        STATE.lastDHCastAt = Now()
+      elseif spellID == SPELL_IDS.DARKGLARE then
+        STATE.lastDGCastAt = Now()
+      elseif spellID == SPELL_IDS.HAUNT then
+        STATE.haunt = Now() + 18 -- approximate Haunt duration
+      elseif spellID == SPELL_IDS.AGONY then
+        STATE.agony = Now() + 18
+      elseif spellID == SPELL_IDS.CORR then
+        STATE.corruption = Now() + 14
+      end
+    end
+  elseif event == "UNIT_AURA" then
+    local unit = ...
+    if unit == "target" then
+      -- Optionally update local dot timers based on aura expiration times
+      -- but we rely on aura for primary dot detection via DotRemaining
+    end
+  end
+end)
+
+-- Initialize spell IDs after ADDON_LOADED
+addon:RegisterEvent("ADDON_LOADED")
+addon:SetScript("OnEvent", function(self, event, ...)
+  if event == "ADDON_LOADED" then
+    local name = ...
+    if name == "WarlockSpells" then
+      ResolveAllSpellIDs()
+    end
+  end
+end)
+
+-- Slash command for testing: print the next spell recommendation
+SLASH_WARLOCKSPELLS1 = "/ws"
+SlashCmdList["WARLOCKSPELLS"] = function()
+  print("Next spell:", NextSpell())
+end
